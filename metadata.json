@@ -1,0 +1,7 @@
+{
+  "name": "Copy of RaïWave Pro",
+  "description": "AI-powered audio enhancer and remix station with deep ocean aesthetics. Features local processing, waveform visualization, and social marketing tools.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
