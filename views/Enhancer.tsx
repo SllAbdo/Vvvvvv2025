@@ -2,9 +2,10 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { AudioProcessParams, Language, Preset } from '../types';
 import { renderAudioFromBuffer, analyzeAudioBuffer, decodeAudio } from '../services/audioUtils';
+import { saveTrackToCloud } from '../services/cloudService';
 import { SliderControl } from '../components/Knobs';
 import Waveform from '../components/Waveform';
-import { Upload, Mic, Download, Loader2, Music, Wand2, Sparkles, CheckCircle, User, Ghost, Bot, Baby, ShieldAlert, Zap, Users, Undo2, Redo2, RotateCcw, Save, FolderOpen, PlayCircle } from 'lucide-react';
+import { Upload, Mic, Download, Loader2, Music, Wand2, Sparkles, CheckCircle, User, Ghost, Bot, Baby, ShieldAlert, Zap, Users, Undo2, Redo2, RotateCcw, Save, FolderOpen, PlayCircle, Cloud, ToggleLeft, ToggleRight, Disc, FileAudio, Clock, HardDrive } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 
 interface EnhancerProps {
@@ -42,19 +43,30 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
     // Files & Buffers
     const [file, setFile] = useState<File | null>(null);
     const [sourceBuffer, setSourceBuffer] = useState<AudioBuffer | null>(null);
+    
+    // We keep two URLs: Original (Source) and Processed (Result)
+    const [originalUrl, setOriginalUrl] = useState<string | null>(null);
+    const [processedUrl, setProcessedUrl] = useState<string | null>(null);
+    
+    // Active Player State
+    const [compareMode, setCompareMode] = useState<'original' | 'processed'>('original');
+    const activeUrl = compareMode === 'processed' ? processedUrl : originalUrl;
+    
     const [processedBlob, setProcessedBlob] = useState<Blob | null>(null);
-    const [audioUrl, setAudioUrl] = useState<string | null>(null);
     
     // Loading States
     const [isProcessing, setIsProcessing] = useState(false);
     const [isAnalyzing, setIsAnalyzing] = useState(false);
     const [isPreviewing, setIsPreviewing] = useState(false);
+    const [isUploading, setIsUploading] = useState(false);
     const [progress, setProgress] = useState(0);
     
     // Recording
     const [isRecording, setIsRecording] = useState(false);
+    const [recordingTime, setRecordingTime] = useState(0);
     const mediaRecorderRef = useRef<MediaRecorder | null>(null);
     const chunksRef = useRef<Blob[]>([]);
+    const recordingTimerRef = useRef<any>(null);
 
     // History & Params
     const [params, setParams] = useState<AudioProcessParams>(INITIAL_PARAMS);
@@ -67,18 +79,30 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
 
     useEffect(() => {
         return () => {
-            if (audioUrl) URL.revokeObjectURL(audioUrl);
+            if (originalUrl) URL.revokeObjectURL(originalUrl);
+            if (processedUrl) URL.revokeObjectURL(processedUrl);
         };
-    }, [audioUrl]);
+    }, [originalUrl, processedUrl]);
+
+    // Whenever processed blob changes, switch to processed view
+    useEffect(() => {
+        if (processedUrl) setCompareMode('processed');
+    }, [processedUrl]);
+
+    // Safe Storage Helper for Presets
+    const getSafePresets = () => {
+        try {
+            const saved = localStorage.getItem('raiwave_presets');
+            return saved ? JSON.parse(saved) : [];
+        } catch (e) {
+            console.warn("Preset storage access restricted");
+            return [];
+        }
+    };
 
     // Load Presets on Mount
     useEffect(() => {
-        const saved = localStorage.getItem('raiwave_presets');
-        if (saved) {
-            try {
-                setSavedPresets(JSON.parse(saved));
-            } catch (e) { console.error(e); }
-        }
+        setSavedPresets(getSafePresets());
     }, []);
 
     const addToHistory = (newParams: AudioProcessParams) => {
@@ -122,8 +146,13 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
         if (name) {
             const newPresets = [...savedPresets, { name, params }];
             setSavedPresets(newPresets);
-            localStorage.setItem('raiwave_presets', JSON.stringify(newPresets));
-            alert("Preset Saved!");
+            try {
+                localStorage.setItem('raiwave_presets', JSON.stringify(newPresets));
+                alert("Preset Saved!");
+            } catch (e) {
+                console.error(e);
+                alert("Could not save preset (Storage Permission Denied).");
+            }
         }
     };
 
@@ -138,10 +167,13 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
             const f = e.target.files[0];
             setFile(f);
             setProcessedBlob(null);
+            setProcessedUrl(null);
             
             // Immediate Playback
-            if(audioUrl) URL.revokeObjectURL(audioUrl);
-            setAudioUrl(URL.createObjectURL(f));
+            if(originalUrl) URL.revokeObjectURL(originalUrl);
+            const url = URL.createObjectURL(f);
+            setOriginalUrl(url);
+            setCompareMode('original');
 
             // Decode in background
             setIsAnalyzing(true);
@@ -157,36 +189,89 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
         }
     };
 
+    const formatTimer = (seconds: number) => {
+        const m = Math.floor(seconds / 60);
+        const s = seconds % 60;
+        return `${m}:${s.toString().padStart(2, '0')}`;
+    };
+
     const startRecording = async () => {
         try {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                alert("Recording not supported in this environment");
+                return;
+            }
+
             const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-            const mr = new MediaRecorder(stream);
+            
+            // Detect best mime type
+            const mimeTypes = [
+                'audio/webm;codecs=opus',
+                'audio/webm',
+                'audio/mp4',
+                'audio/ogg'
+            ];
+            const mimeType = mimeTypes.find(type => MediaRecorder.isTypeSupported(type)) || '';
+            const options = mimeType ? { mimeType } : undefined;
+
+            const mr = new MediaRecorder(stream, options);
             mediaRecorderRef.current = mr;
             chunksRef.current = [];
             
-            mr.ondataavailable = (e) => chunksRef.current.push(e.data);
+            mr.ondataavailable = (e) => {
+                if (e.data.size > 0) chunksRef.current.push(e.data);
+            };
+
             mr.onstop = async () => {
-                const blob = new Blob(chunksRef.current, { type: 'audio/webm' });
-                const recFile = new File([blob], "recording.webm", { type: 'audio/webm' });
+                // Stop all tracks to release mic
+                stream.getTracks().forEach(track => track.stop());
+                
+                if (recordingTimerRef.current) clearInterval(recordingTimerRef.current);
+                setRecordingTime(0);
+
+                const blob = new Blob(chunksRef.current, { type: mimeType || 'audio/webm' });
+                const ext = (mimeType || '').includes('mp4') ? 'm4a' : 'webm';
+                const recFile = new File([blob], `recording.${ext}`, { type: mimeType || 'audio/webm' });
+                
                 setFile(recFile);
-                setAudioUrl(URL.createObjectURL(recFile));
+                
+                // Clear previous URLs
+                if(originalUrl) URL.revokeObjectURL(originalUrl);
+                if(processedUrl) URL.revokeObjectURL(processedUrl);
                 setProcessedBlob(null);
+                setProcessedUrl(null);
+
+                const url = URL.createObjectURL(recFile);
+                setOriginalUrl(url);
+                setCompareMode('original');
                 
                 setIsAnalyzing(true);
-                const buf = await decodeAudio(recFile);
-                setSourceBuffer(buf);
-                setIsAnalyzing(false);
+                try {
+                    const buf = await decodeAudio(recFile);
+                    setSourceBuffer(buf);
+                } catch(e) {
+                    console.error("Recording decode failed", e);
+                    alert("Failed to process recording. Please try again or upload a file.");
+                } finally {
+                    setIsAnalyzing(false);
+                }
             };
+
             mr.start();
             setIsRecording(true);
+            setRecordingTime(0);
+            recordingTimerRef.current = setInterval(() => {
+                setRecordingTime(prev => prev + 1);
+            }, 1000);
+
         } catch (err) {
             console.error(err);
-            alert("Microphone access denied.");
+            alert("Microphone access denied. Please check your browser permissions.");
         }
     };
 
     const stopRecording = () => {
-        if (mediaRecorderRef.current) {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
             mediaRecorderRef.current.stop();
             setIsRecording(false);
         }
@@ -212,24 +297,14 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
         if (!sourceBuffer) return;
         setIsPreviewing(true);
         try {
-            // Slice first 10 seconds
-            const duration = Math.min(10, sourceBuffer.duration);
-            const length = Math.floor(duration * sourceBuffer.sampleRate);
-            const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-            const tempCtx = new AudioContextClass();
-            const sliceBuffer = tempCtx.createBuffer(sourceBuffer.numberOfChannels, length, sourceBuffer.sampleRate);
-            
-            for (let i = 0; i < sourceBuffer.numberOfChannels; i++) {
-                sliceBuffer.copyToChannel(sourceBuffer.getChannelData(i).subarray(0, length), i);
-            }
-            tempCtx.close();
-
-            // Render Slice
-            const outBlob = await renderAudioFromBuffer(sliceBuffer, params, () => {});
+            // Process full buffer instead of a 10s slice
+            const outBlob = await renderAudioFromBuffer(sourceBuffer, params, () => {});
             
             // Play Result
-            if(audioUrl) URL.revokeObjectURL(audioUrl);
-            setAudioUrl(URL.createObjectURL(outBlob));
+            if(processedUrl) URL.revokeObjectURL(processedUrl);
+            const url = URL.createObjectURL(outBlob);
+            setProcessedUrl(url);
+            setCompareMode('processed');
             
         } catch (e) {
             console.error(e);
@@ -246,14 +321,42 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
         try {
             const outBlob = await renderAudioFromBuffer(sourceBuffer, params, (p) => setProgress(p));
             setProcessedBlob(outBlob);
-            if(audioUrl) URL.revokeObjectURL(audioUrl);
-            setAudioUrl(URL.createObjectURL(outBlob)); 
+            if(processedUrl) URL.revokeObjectURL(processedUrl);
+            const url = URL.createObjectURL(outBlob);
+            setProcessedUrl(url);
+            setCompareMode('processed'); // Auto switch to hear result
         } catch (e) {
             console.error(e);
             alert('Processing failed.');
         } finally {
             setIsProcessing(false);
             setProgress(0);
+        }
+    };
+
+    const handleSaveToCloud = async () => {
+        if (!processedBlob || !file) return;
+        setIsUploading(true);
+        
+        // Simulate network delay for realism
+        await new Promise(r => setTimeout(r, 1500));
+        
+        try {
+            const trackData = {
+                id: crypto.randomUUID(),
+                name: `Edited_${file.name}`,
+                date: new Date().toISOString(),
+                tags: ['Edited', 'CloudSave'],
+                blob: processedBlob,
+                duration: sourceBuffer?.duration || 0
+            };
+            await saveTrackToCloud(trackData);
+            alert(isRTL ? 'تم الحفظ في المكتبة السحابية بنجاح' : 'Saved to Cloud Library successfully!');
+        } catch(e) {
+            console.error(e);
+            alert('Failed to save to library.');
+        } finally {
+            setIsUploading(false);
         }
     };
 
@@ -283,8 +386,8 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
 
     const download = async (bitrateLabel: string) => {
         if (!user) {
-            await login(); 
-            if (!localStorage.getItem('raiwave_user')) return;
+            await login('google'); 
+            if (!processedBlob) return; 
         }
         if (!processedBlob) return;
         const a = document.createElement('a');
@@ -345,29 +448,72 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
                         </label>
                         
                         <div className="flex flex-col gap-4">
-                            <label className="flex flex-col items-center justify-center w-full h-28 border-2 border-dashed border-ocean-800 rounded-lg hover:bg-ocean-950 hover:border-primary-400 transition-all cursor-pointer group-hover:shadow-lg group-hover:shadow-primary-400/10">
-                                <div className="flex flex-col items-center justify-center">
-                                    <Upload className="w-6 h-6 mb-2 text-muted group-hover:text-primary-400" />
-                                    <p className="mb-1 text-sm text-slate-400">
-                                        <span className="font-semibold text-primary-400">{isRTL ? 'اضغط للرفع' : 'Click to upload'}</span>
-                                    </p>
-                                    <p className="text-[10px] text-muted">WAV, MP3, AIFF</p>
-                                </div>
-                                <input type="file" className="hidden" accept="audio/*" onChange={handleFileChange} />
-                            </label>
+                            {!file ? (
+                                <label className="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-ocean-800 rounded-xl hover:bg-ocean-950 hover:border-primary-400 transition-all cursor-pointer group-hover:shadow-lg group-hover:shadow-primary-400/10">
+                                    <div className="flex flex-col items-center justify-center">
+                                        <div className="w-12 h-12 mb-3 bg-ocean-900 rounded-full flex items-center justify-center border border-ocean-800 text-primary-400 group-hover:scale-110 transition-transform">
+                                            <Upload size={20} />
+                                        </div>
+                                        <p className="mb-1 text-sm text-slate-400">
+                                            <span className="font-semibold text-primary-400">{isRTL ? 'اضغط للرفع' : 'Click to upload'}</span>
+                                        </p>
+                                        <p className="text-[10px] text-muted">WAV, MP3, AIFF</p>
+                                    </div>
+                                    <input type="file" className="hidden" accept="audio/*" onChange={handleFileChange} />
+                                </label>
+                            ) : (
+                                <div className="relative overflow-hidden bg-gradient-to-r from-ocean-950 to-ocean-900 border border-ocean-800 rounded-xl p-4 flex items-center gap-5 shadow-xl">
+                                    {/* Aesthetic Vinyl Animation */}
+                                    <div className="relative flex-shrink-0 w-20 h-20">
+                                        <div className={`absolute inset-0 rounded-full border-4 border-ocean-800 bg-black flex items-center justify-center ${originalUrl && !isRecording ? 'animate-spin-slow' : ''}`}>
+                                            <div className="w-8 h-8 rounded-full bg-gradient-to-br from-gold-400 to-orange-600 border-2 border-white/20"></div>
+                                            <div className="absolute inset-0 rounded-full bg-[url('https://www.transparenttextures.com/patterns/stardust.png')] opacity-30"></div>
+                                        </div>
+                                        <Disc className="absolute -bottom-1 -right-1 text-gold-400 drop-shadow-lg bg-ocean-950 rounded-full" size={24} />
+                                    </div>
+                                    
+                                    <div className="flex-grow min-w-0">
+                                        <h3 className="text-lg font-bold text-white truncate font-orbitron tracking-wide text-transparent bg-clip-text bg-gradient-to-r from-white to-slate-400">
+                                            {file.name}
+                                        </h3>
+                                        <div className="flex items-center gap-4 mt-2 text-[10px] text-muted font-mono uppercase">
+                                            <span className="flex items-center gap-1 bg-ocean-950/50 px-2 py-1 rounded border border-ocean-800/50">
+                                                <Clock size={10} className="text-primary-400" />
+                                                {sourceBuffer ? `${Math.floor(sourceBuffer.duration)}s` : '--'}
+                                            </span>
+                                            <span className="flex items-center gap-1 bg-ocean-950/50 px-2 py-1 rounded border border-ocean-800/50">
+                                                <HardDrive size={10} className="text-green-400" />
+                                                {(file.size / (1024*1024)).toFixed(2)} MB
+                                            </span>
+                                            <span className="flex items-center gap-1 bg-ocean-950/50 px-2 py-1 rounded border border-ocean-800/50">
+                                                <FileAudio size={10} className="text-gold-400" />
+                                                {file.type.split('/')[1] || 'AUDIO'}
+                                            </span>
+                                        </div>
+                                    </div>
 
-                            <div className="flex gap-3 justify-center">
+                                    <button 
+                                        onClick={() => { setFile(null); setSourceBuffer(null); setOriginalUrl(null); setProcessedUrl(null); setCompareMode('original'); }}
+                                        className="p-2 text-muted hover:text-red-400 transition-colors"
+                                    >
+                                        <RotateCcw size={18} />
+                                    </button>
+                                </div>
+                            )}
+
+                            <div className="flex gap-3 justify-center items-center">
                                 {!isRecording ? (
-                                    <button onClick={startRecording} className="flex items-center gap-2 px-4 py-2 bg-red-500/10 text-red-400 border border-red-500/30 rounded-lg hover:bg-red-500 hover:text-white transition-all">
+                                    <button onClick={startRecording} className="flex items-center gap-2 px-4 py-2 bg-red-500/10 text-red-400 border border-red-500/30 rounded-lg hover:bg-red-500 hover:text-white transition-all shadow-[0_0_10px_rgba(239,68,68,0.2)] hover:shadow-[0_0_20px_rgba(239,68,68,0.4)]">
                                         <Mic size={16} /> {isRTL ? 'تسجيل غناء مباشر' : 'Record Live Vocals'}
                                     </button>
                                 ) : (
-                                    <button onClick={stopRecording} className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg animate-pulse">
-                                        <Mic size={16} /> {isRTL ? 'إيقاف التسجيل' : 'Stop Recording'}
+                                    <button onClick={stopRecording} className="flex items-center gap-3 px-6 py-2 bg-red-600 text-white rounded-full animate-pulse shadow-[0_0_20px_rgba(220,38,38,0.6)] border border-red-400">
+                                        <div className="w-2 h-2 bg-white rounded-full animate-ping" />
+                                        <span className="font-mono font-bold">{formatTimer(recordingTime)}</span>
+                                        <span className="text-xs uppercase tracking-wider">{isRTL ? 'إيقاف' : 'STOP'}</span>
                                     </button>
                                 )}
                             </div>
-                            {file && <p className="text-center text-xs text-gold-400 font-mono">{file.name} {sourceBuffer && `(${Math.floor(sourceBuffer.duration)}s)`}</p>}
                         </div>
                     </div>
 
@@ -385,7 +531,7 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
                                     className="flex items-center gap-2 px-3 py-1.5 rounded-full text-[10px] font-bold bg-ocean-800 border border-ocean-700 hover:bg-ocean-700 text-primary-400 transition-colors"
                                 >
                                     {isPreviewing ? <Loader2 size={12} className="animate-spin"/> : <PlayCircle size={12} />}
-                                    {isRTL ? 'معاينة 10ث' : 'Preview 10s'}
+                                    {isRTL ? 'معاينة كاملة' : 'Full Preview'}
                                 </button>
                                 <button 
                                     onClick={handleAutoEnhance}
@@ -444,10 +590,12 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
                                 <p className="text-[10px] font-bold text-muted mb-4 uppercase">Spatial & Reverb</p>
                                 <div className="grid grid-cols-2 gap-x-8">
                                      <SliderControl isRTL={isRTL} label={isRTL ? 'صدى (Wet)' : "Reverb Mix"} value={params.reverb} min={0} max={1} step={0.05} onChange={v => updateParam('reverb', v)} onCommit={v => updateParam('reverb', v, true)} />
-                                     <SliderControl isRTL={isRTL} label={isRTL ? 'طول الصدى' : "Decay Time"} value={params.reverbDecay} min={0.5} max={5.0} step={0.1} unit="s" onChange={v => updateParam('reverbDecay', v)} onCommit={v => updateParam('reverbDecay', v, true)} />
+                                     <SliderControl isRTL={isRTL} label={isRTL ? 'طول الصدى' : "Reverb Decay"} value={params.reverbDecay} min={0.5} max={5.0} step={0.1} unit="s" onChange={v => updateParam('reverbDecay', v)} onCommit={v => updateParam('reverbDecay', v, true)} />
                                      
                                      <SliderControl isRTL={isRTL} label={isRTL ? 'تأخير (Delay)' : "Delay Mix"} value={params.delay} min={0} max={1} step={0.05} onChange={v => updateParam('delay', v)} onCommit={v => updateParam('delay', v, true)} />
                                      <SliderControl isRTL={isRTL} label={isRTL ? 'زمن التأخير' : "Delay Time"} value={params.delayTime} min={0.01} max={1.0} step={0.01} unit="s" onChange={v => updateParam('delayTime', v)} onCommit={v => updateParam('delayTime', v, true)} />
+
+                                     <SliderControl isRTL={isRTL} label={isRTL ? 'صدى رئيسي' : "Master Reverb"} value={params.masterReverb} min={0} max={1} step={0.05} onChange={v => updateParam('masterReverb', v)} onCommit={v => updateParam('masterReverb', v, true)} />
                                 </div>
                             </div>
 
@@ -473,12 +621,13 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
                             </div>
                         )}
 
-                        <div className={`mt-4 grid grid-cols-2 gap-4 transition-opacity duration-300 ${processedBlob ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
-                            <button onClick={() => download('HQ')} className="flex items-center justify-center gap-2 p-3 bg-ocean-800 hover:bg-ocean-700 rounded-lg text-sm font-semibold border border-ocean-800 hover:border-primary-400 transition-all">
+                        <div className={`mt-4 flex flex-col md:flex-row gap-4 transition-opacity duration-300 ${processedBlob ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
+                            <button onClick={() => download('HQ')} className="flex-1 flex items-center justify-center gap-2 p-3 bg-ocean-800 hover:bg-ocean-700 rounded-lg text-sm font-semibold border border-ocean-800 hover:border-primary-400 transition-all">
                                 <Download size={16} /> WAV Master
                             </button>
-                            <button onClick={() => download('320k')} className="flex items-center justify-center gap-2 p-3 bg-ocean-800 hover:bg-ocean-700 rounded-lg text-sm font-semibold border border-ocean-800 hover:border-primary-400 transition-all">
-                                <Download size={16} /> MP3 320kbps
+                            <button onClick={handleSaveToCloud} className="flex-1 flex items-center justify-center gap-2 p-3 bg-ocean-800 hover:bg-ocean-700 rounded-lg text-sm font-semibold border border-ocean-800 hover:border-gold-400 transition-all">
+                                {isUploading ? <Loader2 size={16} className="animate-spin"/> : <Cloud size={16} />}
+                                {isRTL ? 'حفظ في المكتبة السحابية' : 'Save to Cloud Library'}
                             </button>
                         </div>
                     </div>
@@ -496,20 +645,40 @@ const Enhancer: React.FC<EnhancerProps> = ({ lang }) => {
                          {/* Light Effect Container */}
                          <div className="relative rounded-xl p-[2px] overflow-hidden">
                             <div className="absolute inset-0 bg-gradient-to-br from-gold-400/20 to-primary-400/20 animate-pulse"></div>
-                            <Waveform audioUrl={audioUrl} isRTL={isRTL} />
+                            <Waveform audioUrl={activeUrl} isRTL={isRTL} />
+                            
+                            {/* Compare Switch */}
+                            {processedUrl && (
+                                <div className="absolute top-4 right-4 z-20">
+                                    <div className="flex items-center bg-ocean-950/80 backdrop-blur rounded-full p-1 border border-ocean-800">
+                                        <button 
+                                            onClick={() => setCompareMode('original')}
+                                            className={`px-3 py-1 rounded-full text-[10px] font-bold transition-all ${compareMode === 'original' ? 'bg-ocean-800 text-white' : 'text-muted hover:text-slate-300'}`}
+                                        >
+                                            {isRTL ? 'الأصل' : 'Original'}
+                                        </button>
+                                        <button 
+                                            onClick={() => setCompareMode('processed')}
+                                            className={`px-3 py-1 rounded-full text-[10px] font-bold transition-all ${compareMode === 'processed' ? 'bg-primary-400 text-ocean-950' : 'text-muted hover:text-slate-300'}`}
+                                        >
+                                            {isRTL ? 'المعدل' : 'Result'}
+                                        </button>
+                                    </div>
+                                </div>
+                            )}
                          </div>
                          
                          <div className="bg-gradient-to-br from-ocean-900 to-ocean-950 p-6 rounded-xl border border-ocean-800">
                             <h4 className="text-gold-400 font-bold mb-2 text-sm">PRO TIPS</h4>
                             <ul className="text-xs text-muted leading-relaxed list-disc pl-4 space-y-1">
                                 <li>
-                                    {isRTL ? 'لتفادي الحقوق: استخدم وضع "تخطي الحقوق" الذي يغير بصمة الصوت الرقمية.' : 'Use "Preview 10s" to quickly test your settings before the final render.'}
+                                    {isRTL ? 'قارن: استخدم الأزرار فوق المشغل للتبديل بين الصوت الأصلي والمعدل لحظياً.' : 'Toggle "Original" vs "Result" above the player to instantly compare changes before downloading.'}
                                 </li>
                                 <li>
-                                    {isRTL ? 'الكورال: استخدم "غناء خلفي" لإضافة صوت مصاحب (وهمي) للغناء الأصلي.' : 'Adjust "Decay Time" on Reverb to simulate larger halls.'}
+                                    {isRTL ? 'السحابة: زر "حفظ في المكتبة" يخزن الملف في المتصفح دائماً دون تحميل.' : 'Save to Cloud Library stores your song safely in the browser database.'}
                                 </li>
                                 <li>
-                                    {isRTL ? 'السحر التلقائي: زر "سحر تلقائي" يحلل الملف ويحسن الجودة فوراً.' : 'Save your favorite settings as Presets using the folder icon.'}
+                                    {isRTL ? 'السحر التلقائي: زر "سحر تلقائي" يحلل الملف ويحسن الجودة فوراً.' : 'Use Auto-Magic to instantly clean up noise and boost clarity.'}
                                 </li>
                             </ul>
                          </div>

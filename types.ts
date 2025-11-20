@@ -1,4 +1,5 @@
 
+
 export const View = {
     Enhancer: 'Enhancer',
     Remix: 'Remix',
@@ -51,11 +52,12 @@ export interface RemixParams {
 }
 
 export interface FeedPost {
-    id: number;
+    id: string;
     name: string;
     date: string;
     tags: string[];
-    url: string;
+    blob?: Blob; // Local storage blob
+    duration: number;
 }
 
 export interface Preset {

@@ -11,18 +11,44 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
+// Safe storage helper to prevent "Permission denied" in sandboxed iframes
+const storage = {
+    get: (key: string) => {
+        try {
+            return localStorage.getItem(key);
+        } catch (e) {
+            console.warn("Storage access restricted:", e);
+            return null;
+        }
+    },
+    set: (key: string, value: string) => {
+        try {
+            localStorage.setItem(key, value);
+        } catch (e) {
+            console.warn("Storage access restricted:", e);
+        }
+    },
+    remove: (key: string) => {
+        try {
+            localStorage.removeItem(key);
+        } catch (e) {
+            console.warn("Storage access restricted:", e);
+        }
+    }
+};
+
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
     const [user, setUser] = useState<User | null>(null);
     const [isLoading, setIsLoading] = useState(true);
 
     useEffect(() => {
-        const stored = localStorage.getItem('raiwave_user');
+        const stored = storage.get('raiwave_user');
         if (stored) {
             try {
                 setUser(JSON.parse(stored));
             } catch (e) {
                 console.error("Failed to parse user session", e);
-                localStorage.removeItem('raiwave_user');
+                storage.remove('raiwave_user');
             }
         }
         setIsLoading(false);
@@ -61,7 +87,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 }
                 
                 setUser(mockUser);
-                localStorage.setItem('raiwave_user', JSON.stringify(mockUser));
+                storage.set('raiwave_user', JSON.stringify(mockUser));
                 console.log("Login successful");
                 resolve();
             }, 800);
@@ -70,7 +96,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     const logout = () => {
         setUser(null);
-        localStorage.removeItem('raiwave_user');
+        storage.remove('raiwave_user');
     };
 
     return (
